@@ -130,11 +130,13 @@ Do not commit real secrets. Use placeholders in docs and env files.
 - Changelog: `CHANGELOG.md`
 - Security policy: `SECURITY.md`
 - License: `LICENSE`
+- Issue templates: `.github/ISSUE_TEMPLATE/`
 
 ## Repository hygiene
 
 - Secret scanning is automated with GitHub Actions (`.github/workflows/secret-scan.yml`).
 - Basic CI validation runs on every push and pull request (`.github/workflows/ci.yml`).
+- Dependabot opens weekly dependency update PRs (`.github/dependabot.yml`).
 - Runtime logs and temporary artifacts are ignored via `.gitignore`.
 
 ## License
