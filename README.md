@@ -1,5 +1,8 @@
 # Kokoro Read Aloud (Chrome Extension + Local TTS Server)
 
+[![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
+[![Secret Scan](../../actions/workflows/secret-scan.yml/badge.svg)](../../actions/workflows/secret-scan.yml)
+
 Kokoro Read Aloud lets you highlight text in Chrome, right-click, and play the selection through a local Kokoro text-to-speech server.
 
 ## What the project does
@@ -121,9 +124,17 @@ Do not commit real secrets. Use placeholders in docs and env files.
 - Error responses are sanitized; internal traces are not returned by default.
 - See `SECURITY.md` for vulnerability reporting and hardening guidance.
 
+## Project governance
+
+- Contribution guide: `CONTRIBUTING.md`
+- Changelog: `CHANGELOG.md`
+- Security policy: `SECURITY.md`
+- License: `LICENSE`
+
 ## Repository hygiene
 
 - Secret scanning is automated with GitHub Actions (`.github/workflows/secret-scan.yml`).
+- Basic CI validation runs on every push and pull request (`.github/workflows/ci.yml`).
 - Runtime logs and temporary artifacts are ignored via `.gitignore`.
 
 ## License

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax check server
+        run: python -m py_compile kokoro_server.py
+
+      - name: Validate extension manifest JSON
+        run: python -m json.tool manifest.json > /dev/null
+
+      - name: Validate options page HTML parse
+        run: python - <<'PY'
+from html.parser import HTMLParser
+
+class _Parser(HTMLParser):
+    pass
+
+p = _Parser()
+with open("options.html", "r", encoding="utf-8") as f:
+    p.feed(f.read())
+print("options.html parsed")
+PY
