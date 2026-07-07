@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Kokoro Read Aloud",
+  "version": "1.0.1",
+  "description": "Right-click selected text in Chrome and read it aloud using your local Kokoro TTS server.",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "notifications",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
