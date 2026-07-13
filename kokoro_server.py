@@ -3,10 +3,19 @@ import itertools
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from ipaddress import ip_address
+from pathlib import Path
+
+
+if sys.executable.lower().endswith("pythonw.exe"):
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    sys.stdout = open(log_dir / "kokoro_server.log", "a", buffering=1, encoding="utf-8")
+    sys.stderr = open(log_dir / "kokoro_server.err.log", "a", buffering=1, encoding="utf-8")
 
 import sounddevice as sd
 import torch

@@ -1,7 +1,17 @@
 $ErrorActionPreference = 'Continue'
 
 $Root = $PSScriptRoot
-$Python = Join-Path $Root '.venv\Scripts\python.exe'
+$VenvRoot = 'C:\Users\Admin\kokoro-tts\.venv'
+$VenvSitePackages = Join-Path $VenvRoot 'Lib\site-packages'
+$BasePythonRoot = 'C:\Users\Admin\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none'
+$PythonCandidates = @(
+    (Join-Path $Root '.venv\Scripts\pythonw.exe'),
+    (Join-Path $BasePythonRoot 'pythonw.exe'),
+    (Join-Path $Root '.venv\Scripts\python.exe'),
+    (Join-Path $BasePythonRoot 'python.exe'),
+    (Join-Path $VenvRoot 'Scripts\python.exe')
+)
+$Python = $PythonCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 $Server = Join-Path $Root 'kokoro_server.py'
 $LogDir = Join-Path $Root 'logs'
 $WatchdogLog = Join-Path $LogDir 'kokoro_watchdog.log'
@@ -82,24 +92,26 @@ function Start-KokoroServer {
     Stop-StaleKokoroServers
 
     $pythonCommand = $null
-    $pythonArguments = @('-u', $Server)
-    if (Test-Path $Python) {
+    $pythonArguments = $null
+    if ($Python -and (Test-Path $Python)) {
         $pythonCommand = $Python
+        $pythonArguments = "-u `"$Server`""
     } else {
         $pythonInfo = Get-Command python -ErrorAction SilentlyContinue
         if ($pythonInfo) {
             $pythonCommand = $pythonInfo.Source
+            $pythonArguments = "-u `"$Server`""
         } else {
             $pyInfo = Get-Command py -ErrorAction SilentlyContinue
             if ($pyInfo) {
                 $pythonCommand = $pyInfo.Source
-                $pythonArguments = @('-3', '-u', $Server)
+                $pythonArguments = "-3 -u `"$Server`""
             }
         }
     }
 
     if (-not $pythonCommand) {
-        Write-WatchdogLog "ERROR: Python not found at $Python and no Python launcher was available on PATH."
+        Write-WatchdogLog "ERROR: Python not found in known Kokoro venvs and no Python launcher was available on PATH."
         return $false
     }
     if (-not (Test-Path $Server)) {
@@ -109,15 +121,34 @@ function Start-KokoroServer {
 
     Write-WatchdogLog 'Starting Kokoro server.'
     try {
-        # The watchdog only supervises the server process; the HTTP API owns the work.
-        $proc = Start-Process -FilePath $pythonCommand `
-            -ArgumentList $pythonArguments `
-            -WorkingDirectory $Root `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $ServerLog `
-            -RedirectStandardError $ServerErrLog `
-            -PassThru
-        Write-WatchdogLog "Started Kokoro server PID $($proc.Id)."
+        # Use CreateNoWindow with redirected output. Do not route through cmd.exe:
+        # cmd can create the blank console window this daemon is meant to avoid.
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $pythonCommand
+        $startInfo.Arguments = $pythonArguments
+        $startInfo.WorkingDirectory = $Root
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        if (Test-Path $VenvSitePackages) {
+            $startInfo.EnvironmentVariables['PYTHONPATH'] = $VenvSitePackages
+            $startInfo.EnvironmentVariables['VIRTUAL_ENV'] = $VenvRoot
+            $startInfo.EnvironmentVariables['PATH'] = (Join-Path $VenvRoot 'Scripts') + ';' + $startInfo.EnvironmentVariables['PATH']
+        }
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $startInfo
+        Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+            if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data }
+        } -MessageData $ServerLog | Out-Null
+        Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+            if ($EventArgs.Data) { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data }
+        } -MessageData $ServerErrLog | Out-Null
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+        Write-WatchdogLog "Started hidden Kokoro server PID $($proc.Id) using $pythonCommand."
     } catch {
         Write-WatchdogLog "ERROR: Failed to launch Kokoro server: $($_.Exception.Message)"
         return $false
