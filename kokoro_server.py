@@ -2,6 +2,7 @@ import argparse
 import itertools
 import logging
 import os
+import queue
 import re
 import sys
 import threading
@@ -32,6 +33,7 @@ MAX_REQUEST_CHARS = int(os.getenv("KOKORO_MAX_REQUEST_CHARS", "200000"))
 MAX_JSON_BODY_BYTES = int(os.getenv("KOKORO_MAX_JSON_BODY_BYTES", "250000"))
 API_TOKEN = os.getenv("KOKORO_API_TOKEN", "").strip()
 EXPOSE_DEBUG_STATUS = os.getenv("KOKORO_EXPOSE_DEBUG_STATUS", "false").strip().lower() == "true"
+SERVER_BUILD = "interrupt-v2-same-thread-audio"
 
 ALLOWED_LANG_RE = re.compile(r"^[a-z]{1,8}$")
 ALLOWED_VOICE_RE = re.compile(r"^[a-z]{2}_[a-z0-9]+$")
@@ -43,9 +45,11 @@ class ServerState:
     lang: str = "a"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     state_lock: threading.Lock = field(default_factory=threading.Lock)
+    enqueue_lock: threading.Lock = field(default_factory=threading.Lock)
     playback_lock: threading.Lock = field(default_factory=threading.Lock)
     current_stop: threading.Event | None = None
     current_thread: threading.Thread | None = None
+    job_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
     request_ids: itertools.count = field(default_factory=lambda: itertools.count(1))
     last_status: dict = field(default_factory=lambda: {"state": "idle"})
 
@@ -68,11 +72,12 @@ def require_auth() -> bool:
 @app.get("/health")
 def health():
     with state.state_lock:
-        speaking = state.current_thread is not None and state.current_thread.is_alive()
         last_status = dict(state.last_status)
+        speaking = last_status.get("state") in {"queued", "starting", "speaking"}
     payload = {
         "ok": True,
         "service": "kokoro-read-aloud-server",
+        "build": SERVER_BUILD,
         "device": state.device,
         "cuda_available": torch.cuda.is_available(),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
@@ -133,42 +138,62 @@ def speak():
 def cancel_current_read():
     with state.state_lock:
         stop_event = state.current_stop
-        old_thread = state.current_thread
         state.last_status = {"state": "cancel_requested", "at": time.time()}
+
+    # Drop any queued-but-not-started reads. This prevents rapid right-clicks from
+    # building a backlog of stale Kokoro jobs that all try to run later.
+    while True:
+        try:
+            old_job = state.job_queue.get_nowait()
+        except queue.Empty:
+            break
+        old_job["stop_event"].set()
+        state.job_queue.task_done()
 
     if stop_event is not None:
         stop_event.set()
-    sd.stop()
 
-    # Do not wait for the old worker here. The new /speak request should return
-    # immediately; the new worker will take the playback lock as soon as the old
-    # worker finishes unwinding from sd.stop().
+    # Do not call sounddevice.stop() from the Flask request thread. PortAudio can
+    # crash the process when one thread calls stop while the worker thread is in
+    # sd.wait(). The worker owns playback and will stop audio from that same
+    # thread as soon as it sees the stop event.
 
 
 def start_new_read(text: str, voice: str, speed: float, lang: str) -> int:
-    cancel_current_read()
-    stop_event = threading.Event()
-    request_id = next(state.request_ids)
-    worker = threading.Thread(
-        target=read_worker,
-        kwargs={
+    # Flask is threaded, so multiple /speak requests can arrive almost at once.
+    # Serialize the cancel/drop/enqueue sequence so the one-slot queue never fills
+    # or leaves behind stale work during rapid interrupts.
+    with state.enqueue_lock:
+        cancel_current_read()
+        stop_event = threading.Event()
+        request_id = next(state.request_ids)
+        job = {
             "request_id": request_id,
             "text": text,
             "voice": voice,
             "speed": speed,
             "lang": lang,
             "stop_event": stop_event,
-        },
-        daemon=True,
-    )
+        }
 
-    with state.state_lock:
-        state.current_stop = stop_event
-        state.current_thread = worker
-        state.last_status = {"state": "starting", "request_id": request_id, "at": time.time()}
+        with state.state_lock:
+            state.current_stop = stop_event
+            state.last_status = {"state": "queued", "request_id": request_id, "at": time.time()}
+            if state.current_thread is None or not state.current_thread.is_alive():
+                state.current_thread = threading.Thread(target=read_loop, daemon=True)
+                state.current_thread.start()
 
-    worker.start()
-    return request_id
+        state.job_queue.put_nowait(job)
+        return request_id
+
+
+def read_loop():
+    while True:
+        job = state.job_queue.get()
+        try:
+            read_worker(**job)
+        finally:
+            state.job_queue.task_done()
 
 
 def read_worker(request_id: int, text: str, voice: str, speed: float, lang: str, stop_event: threading.Event):
@@ -186,16 +211,19 @@ def read_worker(request_id: int, text: str, voice: str, speed: float, lang: str,
             ensure_pipeline(lang)
             mark_status("speaking", request_id, chunks, started)
 
-            for _graphemes, _phonemes, audio in state.pipeline(text, voice=voice, speed=speed):
+            for text_chunk in iter_text_chunks(text):
                 if stop_event.is_set():
                     mark_status("cancelled", request_id, chunks, started)
                     return
-                chunks += 1
-                sd.play(audio, 24000)
-                sd.wait()
-                if stop_event.is_set():
-                    mark_status("cancelled", request_id, chunks, started)
-                    return
+                for _graphemes, _phonemes, audio in state.pipeline(text_chunk, voice=voice, speed=speed):
+                    if stop_event.is_set():
+                        mark_status("cancelled", request_id, chunks, started)
+                        return
+                    chunks += 1
+                    play_audio_interruptibly(audio, stop_event)
+                    if stop_event.is_set():
+                        mark_status("cancelled", request_id, chunks, started)
+                        return
 
             mark_status("finished", request_id, chunks, started)
     except Exception as exc:
@@ -223,6 +251,62 @@ def ensure_pipeline(lang: str):
     if state.pipeline is None or lang != state.lang:
         state.lang = lang
         state.pipeline = KPipeline(lang_code=lang, device=state.device)
+
+
+def play_audio_interruptibly(audio, stop_event: threading.Event, sample_rate: int = 24000):
+    """Play one generated audio segment with same-thread cancellation.
+
+    Calling sounddevice.stop() from the request thread while the playback worker
+    is blocked in sd.wait() can hard-crash the local server. Instead, start
+    playback non-blocking and let this worker thread poll the stop event. If a
+    new read arrives, the request thread only sets the event; this worker then
+    stops PortAudio from the same thread that started playback.
+    """
+    sd.play(audio, sample_rate, blocking=False)
+    try:
+        total_seconds = max(0.05, len(audio) / float(sample_rate))
+    except TypeError:
+        total_seconds = 0.5
+
+    deadline = time.perf_counter() + total_seconds
+    while time.perf_counter() < deadline:
+        if stop_event.is_set():
+            sd.stop()
+            return
+        time.sleep(0.025)
+
+
+def iter_text_chunks(text: str, max_chars: int = 300):
+    """Yield smaller chunks so a cancelled long read stops quickly.
+
+    Kokoro can spend noticeable time generating audio for a long passage before
+    yielding the next audio segment. Feeding paragraph/sentence-sized chunks gives
+    the interrupt path many more safe cancellation checkpoints.
+    """
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return
+
+    sentences = re.split(r"(?<=[.!?;:])\s+", normalized)
+    chunk = ""
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            if chunk:
+                yield chunk.strip()
+                chunk = ""
+            for start in range(0, len(sentence), max_chars):
+                yield sentence[start : start + max_chars].strip()
+            continue
+
+        candidate = f"{chunk} {sentence}".strip()
+        if len(candidate) > max_chars and chunk:
+            yield chunk.strip()
+            chunk = sentence
+        else:
+            chunk = candidate
+
+    if chunk:
+        yield chunk.strip()
 
 
 def parse_args():
