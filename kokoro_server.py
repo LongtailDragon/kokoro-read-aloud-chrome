@@ -290,12 +290,15 @@ def iter_text_chunks(text: str, max_chars: int = 300):
     sentences = re.split(r"(?<=[.!?;:])\s+", normalized)
     chunk = ""
     for sentence in sentences:
+        # Do not split an individual sentence at the character limit: cutting at
+        # an arbitrary index can divide a word and make both fragments sound
+        # wrong. An overlong sentence is therefore spoken as one chunk, and the
+        # next chunk begins with the following sentence.
         if len(sentence) > max_chars:
             if chunk:
                 yield chunk.strip()
                 chunk = ""
-            for start in range(0, len(sentence), max_chars):
-                yield sentence[start : start + max_chars].strip()
+            yield sentence.strip()
             continue
 
         candidate = f"{chunk} {sentence}".strip()
